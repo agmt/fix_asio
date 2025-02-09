@@ -23,13 +23,29 @@
 
 namespace FIX {
 
-class AsioConnection : public std::enable_shared_from_this<AsioConnection>,
+// This helper is required because
+//   - boost::asio::ip::tcp::socket doesn't have `.async_write()`
+//   - boost::beast::websocket::stream doesn't supported by `boost::asio::async_write()`
+// Solution: add a helper to make all underlying sockets to support `.async_write()`
+template <typename Protocol, typename Executor>
+class stream_socket_with_write : public boost::asio::basic_stream_socket<Protocol, Executor> {
+public:
+  template <typename... ArgsT> auto async_write(ArgsT &&...args) {
+    return boost::asio::async_write(*this, std::forward<ArgsT>(args)...);
+  }
+};
+
+using tcp_socket_t = stream_socket_with_write<boost::asio::ip::tcp, boost::asio::any_io_executor>;
+
+template <typename socket_t = boost::asio::ip::tcp::socket>
+class AsioConnection : public std::enable_shared_from_this<AsioConnection<socket_t>>,
                        public Responder,
                        private boost::noncopyable {
 protected:
-  using socket_t = boost::asio::ip::tcp::socket;
+  using real_socket_type
+      = std::conditional<std::is_same_v<socket_t, boost::asio::ip::tcp::socket>, tcp_socket_t, socket_t>::type;
 
-  socket_t m_socket;
+  real_socket_type m_socket;
 
   SessionID m_session_id;
   Session *m_pSession;
@@ -154,8 +170,7 @@ protected:
                                                                            : m_queued_outgoing_buffer.size();
       std::copy(m_queued_outgoing_buffer.begin(), m_queued_outgoing_buffer.begin() + sz, m_outgoing_buffer.begin());
       m_queued_outgoing_buffer.erase(m_queued_outgoing_buffer.begin(), m_queued_outgoing_buffer.begin() + sz);
-      boost::asio::async_write(
-          m_socket,
+      m_socket.async_write(
           boost::asio::const_buffer(m_outgoing_buffer.data(), sz),
           [Self = this->shared_from_this()](boost::system::error_code ec, size_t len) {
             Self->AsyncSentSocket(ec, len);
@@ -168,8 +183,7 @@ protected:
     assert(!m_sending);
     m_sending = true;
     std::copy(buf, buf + sz, m_outgoing_buffer.begin());
-    boost::asio::async_write(
-        m_socket,
+    m_socket.async_write(
         boost::asio::const_buffer(m_outgoing_buffer.data(), sz),
         [Self = this->shared_from_this()](boost::system::error_code ec, size_t len) {
           Self->AsyncSentSocket(ec, len);

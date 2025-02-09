@@ -2,6 +2,7 @@
 #define ASIO_FIX_ASIO_ACCEPTOR_HPP
 
 #include "AsioConnection.hpp"
+#include "AsioWSEstablishing.hpp"
 
 #include <quickfix/Acceptor.h>
 
@@ -9,7 +10,9 @@
 
 namespace FIX {
 
-class AsioSocketConnection;
+const char SOCKET_PROTOCOL[] = "SocketProtocol";
+
+template <typename socket_t> class AsioSocketConnection;
 
 class AsioTCPAcceptorServer : public std::enable_shared_from_this<AsioTCPAcceptorServer> {
 public:
@@ -39,7 +42,52 @@ public:
           auto LocalEndpoint = socket.local_endpoint(lec);
           ss << "Accepted connection from " << RemoteEndpoint.address() << " on port " << LocalEndpoint.port();
           Self->m_socketAcceptor->getLog()->onEvent(ss.str());
-          auto sharedConnection = std::make_shared<AsioConnection>(
+          auto sharedConnection = std::make_shared<AsioConnection<>>(
+              std::move(socket),
+              Self->m_socketAcceptor->getLog(),
+              Self->m_socketAcceptor);
+
+          sharedConnection->start();
+          Self->doAccept();
+        });
+  }
+
+protected:
+  boost::asio::io_context &m_ioContext;
+  Acceptor *m_socketAcceptor;
+  boost::asio::ip::tcp::endpoint m_localEndpoint;
+  boost::asio::ip::tcp::acceptor m_acceptor;
+};
+
+class AsioWSAcceptorServer : public std::enable_shared_from_this<AsioWSAcceptorServer> {
+public:
+  AsioWSAcceptorServer(boost::asio::io_context &ioContext, Acceptor *socketAcceptor, uint16_t port)
+      : m_ioContext(ioContext),
+        m_socketAcceptor(socketAcceptor),
+        m_localEndpoint(boost::asio::ip::address_v4{}, port),
+        m_acceptor(ioContext.get_executor(), m_localEndpoint) {}
+
+  AsioWSAcceptorServer(const AsioWSAcceptorServer &) = delete;
+  AsioWSAcceptorServer(AsioWSAcceptorServer &&) = delete;
+
+  void doAccept() {
+    m_acceptor.async_accept(
+        [Self = this->shared_from_this()](boost::system::error_code ec, boost::asio::ip::tcp::socket socket) {
+          std::stringstream ss;
+          if (ec.failed()) {
+            ss << "Accept error: " << ec.to_string();
+            Self->m_socketAcceptor->getLog()->onEvent(ss.str());
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            Self->doAccept();
+            return;
+          }
+
+          boost::system::error_code lec;
+          auto RemoteEndpoint = socket.remote_endpoint(lec);
+          auto LocalEndpoint = socket.local_endpoint(lec);
+          ss << "Accepted connection from " << RemoteEndpoint.address() << " on port " << LocalEndpoint.port();
+          Self->m_socketAcceptor->getLog()->onEvent(ss.str());
+          auto sharedConnection = std::make_shared<AsioWSEstablishingConnection<>>(
               std::move(socket),
               Self->m_socketAcceptor->getLog(),
               Self->m_socketAcceptor);
@@ -105,8 +153,8 @@ private:
         port = (uint16_t)settings.getInt(SOCKET_ACCEPT_PORT);
 
         std::string protocol = "TCP";
-        if (settings.has("SOCKET_PROTOCOL")) {
-          protocol = settings.getString("SOCKET_PROTOCOL");
+        if (settings.has(SOCKET_PROTOCOL)) {
+          protocol = settings.getString(SOCKET_PROTOCOL);
         }
 
         /*
@@ -126,9 +174,15 @@ private:
         auto itServer = m_portToServer.find(port);
         if (itServer == m_portToServer.end()) {
           bool ok;
-          auto server = std::make_shared<AsioTCPAcceptorServer>(m_ioContext, this, port);
-          server->doAccept();
-          std::tie(itServer, ok) = m_portToServer.try_emplace(port, server);
+          if (protocol == "TCP") {
+            auto server = std::make_shared<AsioTCPAcceptorServer>(m_ioContext, this, port);
+            server->doAccept();
+            std::tie(itServer, ok) = m_portToServer.try_emplace(port, server);
+          } else if (protocol == "WS") {
+            auto server = std::make_shared<AsioWSAcceptorServer>(m_ioContext, this, port);
+            server->doAccept();
+            std::tie(itServer, ok) = m_portToServer.try_emplace(port, server);
+          }
         }
       }
     } catch (SocketException &e) {
@@ -150,8 +204,10 @@ private:
   void onStop() override { m_ioContext.stop(); }
 
 protected:
+  using server_variant_t = std::variant<std::shared_ptr<AsioTCPAcceptorServer>, std::shared_ptr<AsioWSAcceptorServer>>;
+
   boost::asio::io_context &m_ioContext;
-  std::map<uint16_t, std::shared_ptr<AsioTCPAcceptorServer>> m_portToServer;
+  std::map<uint16_t, server_variant_t> m_portToServer;
 };
 
 } // namespace FIX

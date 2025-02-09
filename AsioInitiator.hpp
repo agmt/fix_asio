@@ -94,7 +94,7 @@ private:
       throw std::runtime_error(ss.str());
     }
 
-    auto connection = std::make_shared<AsioConnection>(std::move(socket), getLog(), s, session);
+    auto connection = std::make_shared<AsioConnection<>>(std::move(socket), getLog(), s, session);
     connection->start();
   } catch (std::exception &e) {
     getLog()->onEvent(e.what());
